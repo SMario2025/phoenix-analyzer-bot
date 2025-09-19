@@ -1,8 +1,10 @@
-# Phoenix Analyzer Bot — Pretty /check + Rug Check + Wallet Links (Helius) + Membership Gate
+
+# Phoenix Analyzer Bot — Pretty /check + Rug Check + Wallet Links (Helius) + Membership Gate + LP Risk
 import os, time, requests, threading, html
 from collections import defaultdict
 from urllib.parse import urlencode
 from dotenv import load_dotenv
+from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes,
@@ -121,6 +123,7 @@ def summarize_pairs(pairs: list) -> dict:
         "dex_vol24": best.get("volume", {}).get("h24"),
         "dex_pair":  best.get("url"),
         "dex_ath":   best.get("athPrice") or None,
+        "pair_created_at": best.get("pairCreatedAt"),  # <- NEU für Pool-Alter
         "symbol":    best.get("baseToken", {}).get("symbol"),
         "name":      best.get("baseToken", {}).get("name"),
         "socials":   socials[:6],
@@ -139,6 +142,60 @@ def jupiter_price_usd(mint: str, decimals: int) -> float | None:
         return out_amount / 10**6 if out_amount > 0 else None
     except Exception:
         return None
+
+# ===== LP Risk Heuristik =====
+def assess_lp_risk(ds_summary: dict) -> dict:
+    """
+    Heuristik: bewertet LP-Risiko mit Ampelsignal.
+    Nutzt Liquidity-Höhe, Pool-Alter (pairCreatedAt) und 24h-Volumen-Verhältnis.
+    """
+    if not ds_summary:
+        return {"label": "unknown", "reasons": ["No active DEX pair on Solana found."], "score": 50}
+
+    liq = float(ds_summary.get("dex_liq") or 0)
+    vol24 = float(ds_summary.get("dex_vol24") or 0)
+    created_ms = ds_summary.get("pair_created_at")
+    age_hours = None
+    if created_ms:
+        age_hours = max(0, (datetime.now(timezone.utc) - datetime.fromtimestamp(created_ms/1000, tz=timezone.utc)).total_seconds()/3600)
+
+    score = 50
+    reasons = []
+
+    # Liquidity
+    if liq >= 50_000:
+        score += 25; reasons.append(f"✅ Liquidity healthy (~${liq:,.0f}).")
+    elif liq >= 15_000:
+        score += 10; reasons.append(f"ℹ️ Liquidity moderate (~${liq:,.0f}).")
+    else:
+        score -= 20; reasons.append(f"⚠️ Very low liquidity (~${liq:,.0f}).")
+
+    # Pool-Alter
+    if age_hours is None:
+        reasons.append("ℹ️ Pool age unknown.")
+    elif age_hours >= 72:
+        score += 15; reasons.append(f"✅ Pool age {age_hours:.1f}h (3d+).")
+    elif age_hours >= 24:
+        score += 5;  reasons.append(f"ℹ️ Pool age {age_hours:.1f}h (1d+).")
+    else:
+        score -= 15; reasons.append(f"⚠️ Very new pool ({age_hours:.1f}h).")
+
+    # Volumen vs. Liquidity
+    if liq > 0:
+        vol_liq = vol24 / liq
+        if vol_liq > 5:
+            score -= 10; reasons.append("⚠️ 24h volume >> liquidity (possible PnD).")
+        elif vol_liq < 0.1 and (age_hours and age_hours > 48):
+            score -= 5; reasons.append("⚠️ Very low activity vs liquidity.")
+        else:
+            reasons.append("✅ Volume/liquidity looks reasonable.")
+
+    score = max(0, min(100, score))
+    if score >= 75: label = "low risk (LP)"
+    elif score >= 50: label = "medium risk (LP)"
+    else: label = "high risk (LP)"
+
+    return {"label": label, "reasons": reasons, "score": score}
 
 # ===== Helius Wallet-Links =====
 HELIUS_BASE = "https://api.helius.xyz"
@@ -244,7 +301,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "<b>Phoenix Analyzer</b> is online.\n\n"
         "Commands:\n"
-        "• <b>/check</b> – Full report (Safety + Price/ATH/Liquidity/Socials + Rug Check + Wallet Links)\n"
+        "• <b>/check</b> – Full report (Safety + Price/ATH/Liquidity/Socials + Rug Check + Wallet Links + LP Risk)\n"
         "• <b>/slot</b> – Current Solana slot\n"
         "• <b>/ping</b> – Heartbeat\n\n"
         "Join our community to unlock full access.",
@@ -319,8 +376,7 @@ async def check_receive_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             lr = rpc("getTokenLargestAccounts", [mint, {"commitment":"confirmed"}])
             largest = lr.get("value", []) if isinstance(lr, dict) else []
-        except Exception as e:
-            # Fallback bei speziellen RPC-Fehlern
+        except Exception:
             try:
                 lr = rpc_single(FALLBACK_RPC, "getTokenLargestAccounts", [mint, {"commitment":"confirmed"}], timeout=TIMEOUT)
                 largest = lr.get("value", []) if isinstance(lr, dict) else []
@@ -369,6 +425,9 @@ async def check_receive_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
         website = summary.get("website")
         socials = summary.get("socials") or []
 
+        # ---- LP Risk
+        lp = assess_lp_risk(summary) if summary else {"label":"unknown","reasons":["No active DEX pair found."],"score":50}
+
         # ---- RUG CHECK
         rug_flags = []
         if mint_auth is not None:   rug_flags.append("🚩 Mint authority still active")
@@ -388,7 +447,7 @@ async def check_receive_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wallet_links = []
         try:
             wallet_links = analyze_wallet_links(mint, largest, max_wallets=8)
-        except Exception as e:
+        except Exception:
             wallet_links = []
 
         # ---- pretty output
@@ -409,8 +468,15 @@ async def check_receive_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for s in socials[:5]:
                 u = safe(s); lines.append(f"   └ <a href='{u}'>{u}</a>")
         lines.append("")
+        # DEX / LP
+        lines.append("📊 <b>DEX / LP</b>")
+        if pair: lines.append(f"• <a href='{pair}'>Dexscreener Pair</a>")
+        lines.append(f"• <b>LP Risk:</b> {lp['label']} (score {lp['score']}/100)")
+        for r in lp.get("reasons", [])[:5]:
+            lines.append(f"  └ {r}")
 
-        lines.append(f"🛡 <b>Safety</b>")
+        lines.append("")
+        lines.append("🛡 <b>Safety</b>")
         lines.append(f"• <b>Score:</b> {score_badge} {score}/100")
         lines.append(f"  <code>{progress_bar(score)}</code>")
         lines.append(f"• <b>Dev in?</b> {dev_badge}")
@@ -493,7 +559,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
