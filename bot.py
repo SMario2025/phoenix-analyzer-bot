@@ -1,5 +1,4 @@
-
-# Phoenix Analyzer Bot — Pretty /check + Rug Check + Wallet Links (Helius) + Membership Gate + LP Risk
+# Phoenix Analyzer Bot — Pretty /check + Rug Check + Wallet Links (Helius) + Membership Gate + LP Risk + BubbleMap Score
 import os, time, requests, threading, html
 from collections import defaultdict
 from urllib.parse import urlencode
@@ -19,7 +18,7 @@ FALLBACK_RPC    = os.getenv("FALLBACK_RPC", "https://solana-rpc.publicnode.com")
 SECOND_RPC      = os.getenv("SECOND_RPC")
 GROUP_USERNAME  = os.getenv("GROUP_USERNAME", "@PHX2025New")
 GROUP_JOIN_LINK = os.getenv("GROUP_JOIN_LINK", "https://t.me/PHX2025New")
-HELIUS_KEY      = os.getenv("HELIUS_KEY")  # <- wichtig für Wallet-Links
+HELIUS_KEY      = os.getenv("HELIUS_KEY")  # für Wallet-Links & Bubble-Map
 
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN missing in .env")
@@ -96,7 +95,7 @@ def progress_bar(score: int, width=20):
     return "█"*filled + "░"*(width-filled)
 def safe(s: str) -> str: return html.escape(s or "")
 
-# ===== public data (no keys) =====
+# ===== Dexscreener =====
 def fetch_dexscreener_by_mint(mint: str) -> dict:
     r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=15)
     return r.json() if r.status_code == 200 else {}
@@ -123,7 +122,7 @@ def summarize_pairs(pairs: list) -> dict:
         "dex_vol24": best.get("volume", {}).get("h24"),
         "dex_pair":  best.get("url"),
         "dex_ath":   best.get("athPrice") or None,
-        "pair_created_at": best.get("pairCreatedAt"),  # <- NEU für Pool-Alter
+        "pair_created_at": best.get("pairCreatedAt"),  # für Pool-Alter
         "symbol":    best.get("baseToken", {}).get("symbol"),
         "name":      best.get("baseToken", {}).get("name"),
         "socials":   socials[:6],
@@ -145,13 +144,8 @@ def jupiter_price_usd(mint: str, decimals: int) -> float | None:
 
 # ===== LP Risk Heuristik =====
 def assess_lp_risk(ds_summary: dict) -> dict:
-    """
-    Heuristik: bewertet LP-Risiko mit Ampelsignal.
-    Nutzt Liquidity-Höhe, Pool-Alter (pairCreatedAt) und 24h-Volumen-Verhältnis.
-    """
     if not ds_summary:
         return {"label": "unknown", "reasons": ["No active DEX pair on Solana found."], "score": 50}
-
     liq = float(ds_summary.get("dex_liq") or 0)
     vol24 = float(ds_summary.get("dex_vol24") or 0)
     created_ms = ds_summary.get("pair_created_at")
@@ -162,46 +156,31 @@ def assess_lp_risk(ds_summary: dict) -> dict:
     score = 50
     reasons = []
 
-    # Liquidity
-    if liq >= 50_000:
-        score += 25; reasons.append(f"✅ Liquidity healthy (~${liq:,.0f}).")
-    elif liq >= 15_000:
-        score += 10; reasons.append(f"ℹ️ Liquidity moderate (~${liq:,.0f}).")
-    else:
-        score -= 20; reasons.append(f"⚠️ Very low liquidity (~${liq:,.0f}).")
+    if liq >= 50_000: score += 25; reasons.append(f"✅ Liquidity healthy (~${liq:,.0f}).")
+    elif liq >= 15_000: score += 10; reasons.append(f"ℹ️ Liquidity moderate (~${liq:,.0f}).")
+    else: score -= 20; reasons.append(f"⚠️ Very low liquidity (~${liq:,.0f}).")
 
-    # Pool-Alter
-    if age_hours is None:
-        reasons.append("ℹ️ Pool age unknown.")
-    elif age_hours >= 72:
-        score += 15; reasons.append(f"✅ Pool age {age_hours:.1f}h (3d+).")
-    elif age_hours >= 24:
-        score += 5;  reasons.append(f"ℹ️ Pool age {age_hours:.1f}h (1d+).")
-    else:
-        score -= 15; reasons.append(f"⚠️ Very new pool ({age_hours:.1f}h).")
+    if age_hours is None: reasons.append("ℹ️ Pool age unknown.")
+    elif age_hours >= 72: score += 15; reasons.append(f"✅ Pool age {age_hours:.1f}h (3d+).")
+    elif age_hours >= 24: score += 5;  reasons.append(f"ℹ️ Pool age {age_hours:.1f}h (1d+).")
+    else: score -= 15; reasons.append(f"⚠️ Very new pool ({age_hours:.1f}h).")
 
-    # Volumen vs. Liquidity
     if liq > 0:
         vol_liq = vol24 / liq
-        if vol_liq > 5:
-            score -= 10; reasons.append("⚠️ 24h volume >> liquidity (possible PnD).")
-        elif vol_liq < 0.1 and (age_hours and age_hours > 48):
-            score -= 5; reasons.append("⚠️ Very low activity vs liquidity.")
-        else:
-            reasons.append("✅ Volume/liquidity looks reasonable.")
+        if vol_liq > 5: score -= 10; reasons.append("⚠️ 24h volume >> liquidity (possible PnD).")
+        elif vol_liq < 0.1 and (age_hours and age_hours > 48): score -= 5; reasons.append("⚠️ Very low activity vs liquidity.")
+        else: reasons.append("✅ Volume/liquidity looks reasonable.")
 
     score = max(0, min(100, score))
     if score >= 75: label = "low risk (LP)"
     elif score >= 50: label = "medium risk (LP)"
     else: label = "high risk (LP)"
-
     return {"label": label, "reasons": reasons, "score": score}
 
 # ===== Helius Wallet-Links =====
 HELIUS_BASE = "https://api.helius.xyz"
 
 def helius_get_tx_for_address(addr: str, limit=100):
-    """Helius: Liefert letzte Transaktionen inkl. tokenTransfers für Address."""
     if not HELIUS_KEY:
         raise RuntimeError("Helius key not set")
     base = f"{HELIUS_BASE}/v0/addresses/{addr}/transactions"
@@ -209,10 +188,9 @@ def helius_get_tx_for_address(addr: str, limit=100):
     r = requests.get(base + "?" + urlencode(params), timeout=15)
     if r.status_code != 200:
         raise RuntimeError(f"Helius {r.status_code}: {r.text}")
-    return r.json()  # list[tx]
+    return r.json() or []
 
 def rpc_get_recent_token_mints_for_address(addr, max_sigs=30):
-    """Fallback ohne Helius: limitiert & langsamer."""
     other_mints = set()
     try:
         sigs = rpc("getSignaturesForAddress", [addr, {"limit": max_sigs}])
@@ -236,16 +214,13 @@ def rpc_get_recent_token_mints_for_address(addr, max_sigs=30):
     return other_mints
 
 def analyze_wallet_links(target_mint: str, top_holders: list, max_wallets=8):
-    """Check Top-Halter: Mit welchen anderen Token-Mints interagieren sie?"""
     results = []
     wallets = (top_holders or [])[:max_wallets]
     for h in wallets:
         addr = h.get("address") or h.get("addressStr")
         ui   = float(h.get("uiAmount", 0) or 0)
         if not addr: continue
-
         other_mints = set()
-        # Erst Helius
         if HELIUS_KEY:
             try:
                 txs = helius_get_tx_for_address(addr, limit=100)
@@ -256,10 +231,8 @@ def analyze_wallet_links(target_mint: str, top_holders: list, max_wallets=8):
                             other_mints.add(m)
             except Exception:
                 pass
-        # Fallback RPC
         if not other_mints:
             other_mints = rpc_get_recent_token_mints_for_address(addr, max_sigs=30)
-
         sample = list(other_mints)[:6]
         results.append({
             "address": addr,
@@ -268,8 +241,93 @@ def analyze_wallet_links(target_mint: str, top_holders: list, max_wallets=8):
             "other_sample": sample,
             "solscan": solscan(addr)
         })
-        time.sleep(0.12)  # Rate-Limit schonen
+        time.sleep(0.12)
     return results
+
+# ===== Bubblemap-like holder linkage score =====
+def _helius_recent_txs(addr: str, limit=120):
+    if not HELIUS_KEY:
+        return []
+    base = f"{HELIUS_BASE}/v0/addresses/{addr}/transactions"
+    params = {"api-key": HELIUS_KEY, "limit": limit}
+    r = requests.get(base + "?" + urlencode(params), timeout=15)
+    if r.status_code != 200:
+        return []
+    return r.json() or []
+
+def _extract_counterparties(txs: list) -> set:
+    cps = set()
+    for tx in txs or []:
+        for tt in tx.get("tokenTransfers", []) or []:
+            f = tt.get("fromUserAccount"); t = tt.get("toUserAccount")
+            if f and isinstance(f, str): cps.add(f)
+            if t and isinstance(t, str): cps.add(t)
+        for nt in tx.get("nativeTransfers", []) or []:
+            s = nt.get("fromUserAccount"); r = nt.get("toUserAccount")
+            if s and isinstance(s, str): cps.add(s)
+            if r and isinstance(r, str): cps.add(r)
+    return cps
+
+def bubblemap_score_for_holders(top_holders: list, self_mint: str, per_wallet_limit=120):
+    nodes = []
+    for h in (top_holders or [])[:15]:
+        a = h.get("address") or h.get("addressStr")
+        if a: nodes.append(a)
+    nodes = list(dict.fromkeys(nodes))
+    if not nodes:
+        return {"score": 50, "label": "unknown", "reasons": ["No holder data available."], "edges": []}
+
+    cp_map = {}
+    for a in nodes:
+        try:
+            txs = _helius_recent_txs(a, limit=per_wallet_limit)
+            cps = _extract_counterparties(txs)
+            cps.discard(a)
+            cp_map[a] = cps
+        except Exception:
+            cp_map[a] = set()
+        time.sleep(0.12)
+
+    edges = set()
+    deg = {a: 0 for a in nodes}
+    for i in range(len(nodes)):
+        for j in range(i+1, len(nodes)):
+            a, b = nodes[i], nodes[j]
+            linked = (b in cp_map.get(a, set())) or (a in cp_map.get(b, set()))
+            if linked:
+                edges.add((a, b)); deg[a] += 1; deg[b] += 1
+
+    edge_count = len(edges)
+    n = len(nodes)
+    max_possible = n*(n-1)//2 if n > 1 else 1
+    density = edge_count / max_possible if max_possible > 0 else 0.0
+    max_deg = max(deg.values()) if deg else 0
+    hub_ratio = (max_deg / (n-1)) if n > 1 else 0.0
+
+    score = 80
+    reasons = []
+    if density >= 0.5:   score -= 25; reasons.append("Dense cluster among top holders (high linkage).")
+    elif density >= 0.25: score -= 12; reasons.append("Moderate linkage among top holders.")
+    else:                score += 8;  reasons.append("Sparse linkage (healthy).")
+
+    if hub_ratio >= 0.6: score -= 20; reasons.append("Single hub wallet connects many holders.")
+    elif hub_ratio >= 0.4: score -= 10; reasons.append("Some centralization (one wallet links several).")
+    else:                 score += 5;  reasons.append("No dominant hub detected.")
+
+    score = max(0, min(100, score))
+    if score >= 80: label = "low risk (clusters)"
+    elif score >= 60: label = "medium risk (clusters)"
+    else: label = "high risk (clusters)"
+
+    pretty_edges = [f"{a[:6]}…{a[-6:]} ↔ {b[:6]}…{b[-6:]}" for a,b in sorted(edges)]
+    return {
+        "score": score,
+        "label": label,
+        "reasons": reasons,
+        "edges": pretty_edges[:8],
+        "density": round(density, 3),
+        "max_deg_ratio": round(hub_ratio, 3),
+    }
 
 # ===== membership gate =====
 async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -301,7 +359,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "<b>Phoenix Analyzer</b> is online.\n\n"
         "Commands:\n"
-        "• <b>/check</b> – Full report (Safety + Price/ATH/Liquidity/Socials + Rug Check + Wallet Links + LP Risk)\n"
+        "• <b>/check</b> – Full report (Safety + Price/ATH/Liquidity/Socials + LP Risk + Bubble-Map + Wallet Links)\n"
         "• <b>/slot</b> – Current Solana slot\n"
         "• <b>/ping</b> – Heartbeat\n\n"
         "Join our community to unlock full access.",
@@ -409,7 +467,7 @@ async def check_receive_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ui   = float(a.get("uiAmount", 0) or 0)
             if addr: holder_lines.append(f"• {ui:.4f} — <a href='{solscan(addr)}'>Solscan</a>")
 
-        # ---- off-chain
+        # ---- off-chain (Dexscreener)
         ds = fetch_dexscreener_by_mint(mint)
         pairs = ds.get("pairs", []) if isinstance(ds, dict) else []
         summary = summarize_pairs(pairs) if pairs else {}
@@ -427,6 +485,13 @@ async def check_receive_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ---- LP Risk
         lp = assess_lp_risk(summary) if summary else {"label":"unknown","reasons":["No active DEX pair found."],"score":50}
+
+        # ---- Bubble-Map (Top-Halter-Verknüpfungen)
+        bmap = {}
+        try:
+            bmap = bubblemap_score_for_holders(largest, self_mint=mint, per_wallet_limit=120)
+        except Exception:
+            bmap = {"score": 50, "label": "unknown", "reasons": ["Link analysis failed"], "edges": []}
 
         # ---- RUG CHECK
         rug_flags = []
@@ -468,13 +533,20 @@ async def check_receive_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for s in socials[:5]:
                 u = safe(s); lines.append(f"   └ <a href='{u}'>{u}</a>")
         lines.append("")
-        # DEX / LP
         lines.append("📊 <b>DEX / LP</b>")
         if pair: lines.append(f"• <a href='{pair}'>Dexscreener Pair</a>")
         lines.append(f"• <b>LP Risk:</b> {lp['label']} (score {lp['score']}/100)")
         for r in lp.get("reasons", [])[:5]:
             lines.append(f"  └ {r}")
-
+        lines.append("")
+        lines.append("🫧 <b>Bubble-Map (Holder Linkage)</b>")
+        lines.append(f"• <b>Cluster Risk:</b> {bmap.get('label','unknown')} (score {bmap.get('score',0)}/100)")
+        for r in bmap.get("reasons", [])[:3]:
+            lines.append(f"  └ {r}")
+        if bmap.get("edges"):
+            lines.append("• Links among top holders:")
+            for e in bmap["edges"]:
+                lines.append(f"  └ {e}")
         lines.append("")
         lines.append("🛡 <b>Safety</b>")
         lines.append(f"• <b>Score:</b> {score_badge} {score}/100")
@@ -487,26 +559,22 @@ async def check_receive_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if holder_lines:
             lines.append("• <b>Top holders:</b>")
             lines += holder_lines
-
         lines.append("")
         lines.append("💀 <b>RUG CHECK</b>")
         lines.append(rug_status)
         if rug_flags:
             for f in rug_flags: lines.append(f"• {f}")
-
         lines.append("")
         lines.append("🔗 <b>Wallet Links</b>")
         if wallet_links:
             for w in wallet_links:
-                addr = w['address']
-                cnt  = w['other_count']
+                addr = w['address']; cnt = w['other_count']
                 sample = ", ".join([f"<code>{m[:6]}...{m[-6:]}</code>" for m in w['other_sample']]) if w['other_sample'] else "—"
                 lines.append(f"• <a href='{w['solscan']}'>{addr[:6]}...{addr[-6:]}</a> — holds {cnt} other mints | sample: {sample}")
         else:
             lines.append("• Could not fetch wallet links (rate limit or missing key).")
-
         lines.append("")
-        lines.append("ℹ️ <i>This is not financial advice. LP-lock / honeypot checks are planned.</i>")
+        lines.append("ℹ️ <i>This is not financial advice. Heuristics only. DYOR.</i>")
 
         text = "\n".join(lines)
         if len(text) > 3900: text = text[:3800] + "\n… (trimmed)"
@@ -532,7 +600,7 @@ async def check_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Canceled.")
     return ConversationHandler.END
 
-# Optional: Webhook sicher entfernen (falls mal gesetzt) – verhindert „stummes“ Polling
+# Optional: Webhook clean
 async def post_init(app):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -541,11 +609,9 @@ async def post_init(app):
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("slot", slot))
-
     conv_check = ConversationHandler(
         entry_points=[CommandHandler("check", check_start)],
         states={ ASK_CA_CHECK: [MessageHandler(filters.TEXT & ~filters.COMMAND, check_receive_ca)] },
@@ -553,12 +619,12 @@ def main():
         allow_reentry=True,
     )
     app.add_handler(conv_check)
-
     print("🚀 Bot läuft…")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
+
 
 
 
